@@ -1,0 +1,1645 @@
+From 043bb9b4386c547152974bd1b266d52622683e8e Mon Sep 17 00:00:00 2001
+From: patch <p@p>
+Date: Thu, 17 Sep 2026 22:25:16 +0000
+Subject: [PATCH] Case battery threshold, efficiency, alerts and Tasker export
+
+---
+ .github/workflows/fork-apk.yml                |  39 ++
+ app/src/main/AndroidManifest.xml              |  20 ++
+ .../battery/CaseBatteryAlarmReceiver.kt       |  56 +++
+ .../budsdynamiceq/battery/CaseBatteryMath.kt  | 230 ++++++++++++
+ .../battery/CaseBatteryMonitor.kt             | 309 ++++++++++++++++
+ .../budsdynamiceq/battery/CaseBatteryStore.kt | 134 +++++++
+ .../budsdynamiceq/battery/TaskerBridge.kt     | 114 ++++++
+ .../battery/TaskerQueryReceiver.kt            |  59 ++++
+ .../budsdynamiceq/service/BudsService.kt      |   7 +
+ .../ui/settings/AppSettingsScreen.kt          |   3 +
+ .../ui/settings/CaseBatterySettingsCard.kt    | 334 ++++++++++++++++++
+ app/src/main/res/values/strings.xml           |  34 ++
+ .../battery/CaseBatteryMathTest.kt            | 176 +++++++++
+ 13 files changed, 1515 insertions(+)
+ create mode 100644 .github/workflows/fork-apk.yml
+ create mode 100644 app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryAlarmReceiver.kt
+ create mode 100644 app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMath.kt
+ create mode 100644 app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMonitor.kt
+ create mode 100644 app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryStore.kt
+ create mode 100644 app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerBridge.kt
+ create mode 100644 app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerQueryReceiver.kt
+ create mode 100644 app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/CaseBatterySettingsCard.kt
+ create mode 100644 app/src/test/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMathTest.kt
+
+diff --git a/.github/workflows/fork-apk.yml b/.github/workflows/fork-apk.yml
+new file mode 100644
+index 0000000..31c1758
+--- /dev/null
++++ b/.github/workflows/fork-apk.yml
+@@ -0,0 +1,39 @@
++name: Fork APK
++
++# Builds an installable, debug-signed APK from any branch in a fork.
++# Run it from the Actions tab (Run workflow) or just push to your branch.
++
++on:
++  push:
++    branches-ignore: [ "master", "staging" ]
++  workflow_dispatch:
++
++jobs:
++  apk:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v5
++
++      - name: Set up JDK 21
++        uses: actions/setup-java@v5
++        with:
++          java-version: '21'
++          distribution: 'temurin'
++          cache: gradle
++
++      - name: Grant execute permission for gradlew
++        run: chmod +x gradlew
++
++      - name: Run unit tests
++        run: ./gradlew testGithubDebugUnitTest
++
++      - name: Build debug APK
++        run: ./gradlew assembleGithubDebug
++
++      - name: Upload APK
++        uses: actions/upload-artifact@v4
++        with:
++          name: budbuddy-case-battery-apk
++          path: app/build/outputs/apk/github/debug/app-github-debug.apk
++          if-no-files-found: error
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index fa8f015..8225dd5 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -83,6 +83,26 @@
+             </intent-filter>
+         </receiver>
+ 
++        <receiver
++            android:name=".battery.CaseBatteryAlarmReceiver"
++            android:enabled="true"
++            android:exported="false">
++            <intent-filter>
++                <action android:name="com.benegedeniz.budsdynamiceq.CASE_STANDBY_CHECK" />
++            </intent-filter>
++        </receiver>
++
++        <!-- Exported so Tasker and similar automation apps can ask for the current
++             battery state. It only answers when "Expose to Tasker" is enabled. -->
++        <receiver
++            android:name=".battery.TaskerQueryReceiver"
++            android:enabled="true"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="com.benegedeniz.budsdynamiceq.REQUEST_BATTERY" />
++            </intent-filter>
++        </receiver>
++
+         <provider
+             android:name="androidx.core.content.FileProvider"
+             android:authorities="${applicationId}.provider"
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryAlarmReceiver.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryAlarmReceiver.kt
+new file mode 100644
+index 0000000..a990afe
+--- /dev/null
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryAlarmReceiver.kt
+@@ -0,0 +1,56 @@
++package com.benegedeniz.budsdynamiceq.battery
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.util.Log
++
++/**
++ * Wakes up periodically while the buds are away to project the case's standby
++ * self-discharge, using the last level the earbuds reported.
++ */
++class CaseBatteryAlarmReceiver : BroadcastReceiver() {
++
++    companion object {
++        private const val TAG = "CaseBatteryAlarm"
++        const val ACTION_STANDBY_CHECK = "com.benegedeniz.budsdynamiceq.CASE_STANDBY_CHECK"
++    }
++
++    override fun onReceive(context: Context, intent: Intent?) {
++        if (intent?.action != ACTION_STANDBY_CHECK) return
++
++        val store = CaseBatteryStore(context)
++        val config = store.config(null)
++        if (!config.enabled) return
++
++        val last = store.lastReading() ?: return
++        val elapsedHours = (System.currentTimeMillis() - last.timestampMs) / 3_600_000.0
++        if (elapsedHours < 0) return
++
++        // Age the last known case level by the configured standby drain.
++        val agedLevel = CaseBatteryMath.levelAfterStandby(
++            last.caseLevel.toDouble(), config.standbyDrainPerDay, elapsedHours
++        )
++
++        val estimate = CaseBatteryMonitor.evaluateAndNotify(
++            context = context,
++            store = store,
++            config = config,
++            caseLevel = agedLevel.toInt(),
++            budL = last.budL,
++            budR = last.budR,
++            caseIsCharging = false
++        )
++
++        if (config.taskerEnabled) {
++            TaskerBridge.broadcast(context, estimate, config, false, "STANDBY")
++        }
++
++        Log.d(TAG, "Standby check: aged=$agedLevel reason=${estimate.reason}")
++
++        CaseBatteryMonitor.scheduleStandbyCheck(
++            context,
++            CaseBatteryMath.nextStandbyCheckDelayMs(estimate.hoursUntilThreshold, config.alertHorizonHours)
++        )
++    }
++}
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMath.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMath.kt
+new file mode 100644
+index 0000000..9aaf3e8
+--- /dev/null
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMath.kt
+@@ -0,0 +1,230 @@
++package com.benegedeniz.budsdynamiceq.battery
++
++import kotlin.math.max
++import kotlin.math.min
++import kotlin.math.roundToInt
++
++/**
++ * Pure (Android-free) math for case battery projection.
++ *
++ * Everything here is deterministic and unit-testable on the JVM: no Context,
++ * no flows, no SharedPreferences. The Android glue lives in CaseBatteryMonitor.
++ */
++
++/** User-tunable configuration, persisted by SettingsRepository. */
++data class CaseBatteryConfig(
++    val enabled: Boolean = false,
++    /** Case level (%) considered "low". Alerts fire at or below this. */
++    val thresholdPercent: Int = DEFAULT_THRESHOLD,
++    /** Charge transfer efficiency (%). Lower = more case charge burned per bud %. */
++    val efficiencyPercent: Int = DEFAULT_EFFICIENCY,
++    /**
++     * Ideal (lossless) case cost, in case %, of charging BOTH buds from 0% to 100%.
++     * Derived from cell capacities: 2 * budMah / caseMah * 100.
++     */
++    val fullChargeCaseCostPercent: Double = DEFAULT_FULL_CHARGE_COST,
++    /** Case self-discharge while idle in a pocket/drawer, in % per day. */
++    val standbyDrainPerDay: Double = DEFAULT_STANDBY_DRAIN,
++    /** Warn when the case is projected to hit the threshold within this many hours. */
++    val alertHorizonHours: Int = DEFAULT_HORIZON_HOURS,
++    /** Broadcast state to Tasker / other automation apps. */
++    val taskerEnabled: Boolean = false
++) {
++    /** Effective case cost of a full 0->100 charge of both buds, losses included. */
++    val effectiveFullCycleCost: Double
++        get() = fullChargeCaseCostPercent * (100.0 / efficiencyPercent.coerceIn(1, 100))
++
++    companion object {
++        const val DEFAULT_THRESHOLD = 20
++        const val DEFAULT_EFFICIENCY = 85
++        const val DEFAULT_FULL_CHARGE_COST = 20.6
++        const val DEFAULT_STANDBY_DRAIN = 1.0
++        const val DEFAULT_HORIZON_HOURS = 72
++    }
++}
++
++/** Why an alert should be shown (or not). */
++enum class CaseAlertReason { NONE, ALREADY_BELOW, PROJECTED_BELOW, STANDBY_ETA }
++
++data class CaseBatteryEstimate(
++    /** Case level reported by the buds, or -1 when unknown. */
++    val caseNow: Int,
++    val budL: Int,
++    val budR: Int,
++    /** Case % that topping both buds up to 100% is expected to consume. */
++    val chargeCostPercent: Double,
++    /** Case % expected to remain once both buds are full. */
++    val projectedCasePercent: Double,
++    /** Hours from now until the case reaches the threshold, standby drain only. */
++    val hoursUntilThreshold: Double,
++    val reason: CaseAlertReason,
++    val valid: Boolean
++) {
++    val shouldAlert: Boolean get() = reason != CaseAlertReason.NONE
++    val projectedCaseRounded: Int get() = projectedCasePercent.roundToInt()
++    val daysUntilThreshold: Double get() = hoursUntilThreshold / 24.0
++}
++
++object CaseBatteryMath {
++
++    /**
++     * Estimated ideal full-cycle case cost (%) per model, from published cell capacities.
++     * Keyed by BudsModel.name so this file stays Android-free.
++     * Values for unreleased/unknown models fall back to the 53 mAh bud / 515 mAh case pair.
++     */
++    private val FULL_CYCLE_COST_BY_MODEL: Map<String, Double> = mapOf(
++        "BUDS_4_PRO" to 20.6,   // assumed 53 mAh buds / 515 mAh case - calibrate to be sure
++        "BUDS_4" to 20.6,       // assumed
++        "BUDS_3_PRO" to 20.6,   // 53 / 515
++        "BUDS_3" to 18.6,       // 48 / 515
++        "BUDS_3_FE" to 20.6,    // assumed
++        "BUDS_2_PRO" to 23.7,   // 61 / 515
++        "BUDS_2" to 25.8,       // 61 / 472
++        "BUDS_FE" to 25.1       // 60 / 479
++    )
++
++    fun defaultFullCycleCost(modelName: String?): Double =
++        FULL_CYCLE_COST_BY_MODEL[modelName] ?: CaseBatteryConfig.DEFAULT_FULL_CHARGE_COST
++
++    /** True when a battery reading is a real value rather than the -1 "unknown" sentinel. */
++    fun isValidLevel(level: Int): Boolean = level in 0..100
++
++    /**
++     * Fraction (0..1) of a full two-bud charge still missing.
++     * A single unknown bud is treated as "as empty as its twin" rather than as 0%,
++     * so a one-bud-in-case reading does not halve the estimate.
++     */
++    fun budDeficitFraction(budL: Int, budR: Int): Double {
++        val l = if (isValidLevel(budL)) budL else budR
++        val r = if (isValidLevel(budR)) budR else budL
++        if (!isValidLevel(l) || !isValidLevel(r)) return 0.0
++        return (((100 - l) + (100 - r)) / 200.0).coerceIn(0.0, 1.0)
++    }
++
++    /** Case % that will be spent bringing both buds up to 100%. */
++    fun chargeCost(budL: Int, budR: Int, config: CaseBatteryConfig): Double =
++        config.effectiveFullCycleCost * budDeficitFraction(budL, budR)
++
++    /** Case level after standby self-discharge for [elapsedHours]. */
++    fun levelAfterStandby(level: Double, drainPerDay: Double, elapsedHours: Double): Double =
++        (level - drainPerDay * (elapsedHours / 24.0)).coerceIn(0.0, 100.0)
++
++    /**
++     * Hours of standby before [level] decays to [threshold].
++     * Returns 0 when already at/below, and [Double.POSITIVE_INFINITY] when drain is zero.
++     */
++    fun hoursUntilThreshold(level: Double, threshold: Int, drainPerDay: Double): Double {
++        if (level <= threshold) return 0.0
++        if (drainPerDay <= 0.0) return Double.POSITIVE_INFINITY
++        return (level - threshold) / drainPerDay * 24.0
++    }
++
++    /**
++     * The main entry point.
++     *
++     * @param caseNow case level reported by the buds (-1 when unknown)
++     * @param budL/budR bud levels (-1 when unknown)
++     * @param caseIsCharging true when the case itself is plugged in; suppresses alerts
++     */
++    fun estimate(
++        caseNow: Int,
++        budL: Int,
++        budR: Int,
++        config: CaseBatteryConfig,
++        caseIsCharging: Boolean = false
++    ): CaseBatteryEstimate {
++        if (!isValidLevel(caseNow)) {
++            return CaseBatteryEstimate(
++                caseNow = caseNow, budL = budL, budR = budR,
++                chargeCostPercent = 0.0, projectedCasePercent = -1.0,
++                hoursUntilThreshold = Double.POSITIVE_INFINITY,
++                reason = CaseAlertReason.NONE, valid = false
++            )
++        }
++
++        val cost = chargeCost(budL, budR, config)
++        val projected = (caseNow - cost).coerceIn(0.0, 100.0)
++        val eta = hoursUntilThreshold(projected, config.thresholdPercent, config.standbyDrainPerDay)
++
++        val reason = when {
++            caseIsCharging -> CaseAlertReason.NONE
++            caseNow <= config.thresholdPercent -> CaseAlertReason.ALREADY_BELOW
++            projected <= config.thresholdPercent -> CaseAlertReason.PROJECTED_BELOW
++            eta <= config.alertHorizonHours -> CaseAlertReason.STANDBY_ETA
++            else -> CaseAlertReason.NONE
++        }
++
++        return CaseBatteryEstimate(
++            caseNow = caseNow, budL = budL, budR = budR,
++            chargeCostPercent = cost, projectedCasePercent = projected,
++            hoursUntilThreshold = eta, reason = reason, valid = true
++        )
++    }
++
++    /**
++     * Calibration: derive the measured *effective* full-cycle cost from one observed
++     * charge episode, e.g. buds went 40% -> 100% (avg gain 60) while the case dropped 13%.
++     * Returns null when the episode is too small or physically implausible.
++     */
++    fun measuredFullCycleCost(avgBudGainPercent: Double, caseDropPercent: Double): Double? {
++        if (avgBudGainPercent < 15.0) return null      // too small to be meaningful
++        if (caseDropPercent <= 0.0) return null        // case was plugged in, or rounding noise
++        val cost = caseDropPercent / (avgBudGainPercent / 100.0)
++        if (cost < 2.0 || cost > 90.0) return null     // implausible; discard
++        return cost
++    }
++
++    /** Convert a measured effective cost back into the stored ideal cost for the given efficiency. */
++    fun idealCostFromMeasured(measuredEffectiveCost: Double, efficiencyPercent: Int): Double =
++        measuredEffectiveCost * (efficiencyPercent.coerceIn(1, 100) / 100.0)
++
++    /** Exponentially weighted average used to smooth successive calibration samples. */
++    fun blendCalibration(previous: Double?, sample: Double, weight: Double = 0.4): Double =
++        if (previous == null) sample else previous * (1 - weight) + sample * weight
++
++    /**
++     * Decide whether an alert is worth showing again, given the previous one.
++     * Re-alerts on a new reason, on a meaningful further drop, or after a cooldown.
++     */
++    fun shouldNotify(
++        reason: CaseAlertReason,
++        level: Int,
++        lastReason: String?,
++        lastLevel: Int,
++        lastTimestampMs: Long,
++        nowMs: Long,
++        cooldownMs: Long = DEFAULT_COOLDOWN_MS,
++        minDropToRepeat: Int = 5
++    ): Boolean {
++        if (reason == CaseAlertReason.NONE) return false
++        if (lastReason == null) return true
++        if (lastReason != reason.name) return true
++        if (isValidLevel(lastLevel) && isValidLevel(level) && lastLevel - level >= minDropToRepeat) return true
++        return nowMs - lastTimestampMs >= cooldownMs
++    }
++
++    const val DEFAULT_COOLDOWN_MS: Long = 6 * 60 * 60 * 1000L
++
++    /**
++     * Delay until the next standby re-check: wake shortly before the case is expected
++     * to cross the threshold, but never sooner than 1 h or later than 24 h.
++     */
++    fun nextStandbyCheckDelayMs(
++        hoursUntilThreshold: Double,
++        horizonHours: Int,
++        minHours: Double = 1.0,
++        maxHours: Double = 24.0
++    ): Long {
++        val target = if (!hoursUntilThreshold.isFinite()) maxHours
++        else (hoursUntilThreshold - horizonHours).coerceIn(minHours, maxHours)
++        return (target * 60.0 * 60.0 * 1000.0).toLong()
++    }
++
++    /** "2 d 4 h" style formatting, locale-free; the UI layer adds translated units. */
++    fun splitHours(hours: Double): Pair<Int, Int> {
++        val clamped = max(0.0, min(hours, 9999.0))
++        val days = (clamped / 24.0).toInt()
++        val rem = (clamped - days * 24).roundToInt()
++        return if (rem == 24) Pair(days + 1, 0) else Pair(days, rem)
++    }
++}
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMonitor.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMonitor.kt
+new file mode 100644
+index 0000000..558961e
+--- /dev/null
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMonitor.kt
+@@ -0,0 +1,309 @@
++package com.benegedeniz.budsdynamiceq.battery
++
++import android.app.AlarmManager
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.Context
++import android.content.Intent
++import android.os.Build
++import android.util.Log
++import androidx.core.app.NotificationCompat
++import com.benegedeniz.budsdynamiceq.MainActivity
++import com.benegedeniz.budsdynamiceq.R
++import com.benegedeniz.budsdynamiceq.bluetooth.BudsController
++import com.benegedeniz.budsdynamiceq.data.model.PlacementState
++import com.benegedeniz.budsdynamiceq.util.LanguageUtils
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.launch
++import kotlin.math.roundToInt
++
++/**
++ * Watches case/bud battery levels and warns when the case will not have enough
++ * charge left after topping the earbuds up, or when it will decay to the
++ * threshold on its own while sitting in standby.
++ *
++ * The case level is only reported by the earbuds while at least one bud is in the
++ * case (see BudsPacketParser), so a fresh evaluation naturally happens when you
++ * put a bud back or open the case.
++ */
++class CaseBatteryMonitor(
++    private val context: Context,
++    private val scope: CoroutineScope,
++    private val budsController: BudsController
++) {
++
++    companion object {
++        private const val TAG = "CaseBatteryMonitor"
++        const val CHANNEL_ID = "case_battery_channel"
++        const val NOTIFICATION_ID = 42
++
++        /** Re-evaluate standby decay even if the alarm is missed, on next service start. */
++        fun scheduleStandbyCheck(context: Context, delayMs: Long) {
++            val alarmManager = context.getSystemService(AlarmManager::class.java) ?: return
++            val intent = Intent(context, CaseBatteryAlarmReceiver::class.java).apply {
++                action = CaseBatteryAlarmReceiver.ACTION_STANDBY_CHECK
++            }
++            val pending = PendingIntent.getBroadcast(
++                context, 77, intent,
++                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
++            )
++            val triggerAt = System.currentTimeMillis() + delayMs
++            try {
++                // Inexact + allow-while-idle: no SCHEDULE_EXACT_ALARM permission needed.
++                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
++            } catch (e: SecurityException) {
++                Log.w(TAG, "Could not schedule standby check", e)
++            }
++        }
++
++        fun cancelStandbyCheck(context: Context) {
++            val alarmManager = context.getSystemService(AlarmManager::class.java) ?: return
++            val intent = Intent(context, CaseBatteryAlarmReceiver::class.java).apply {
++                action = CaseBatteryAlarmReceiver.ACTION_STANDBY_CHECK
++            }
++            val pending = PendingIntent.getBroadcast(
++                context, 77, intent,
++                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
++            )
++            alarmManager.cancel(pending)
++        }
++
++        fun createChannel(context: Context) {
++            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
++            val localized = LanguageUtils.setLocale(context)
++            val channel = NotificationChannel(
++                CHANNEL_ID,
++                localized.getString(R.string.case_battery_channel_name),
++                NotificationManager.IMPORTANCE_DEFAULT
++            ).apply {
++                description = localized.getString(R.string.case_battery_channel_desc)
++            }
++            context.getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
++        }
++
++        /**
++         * Shared evaluation path used both by the live monitor and by the standby alarm.
++         * Returns the estimate so callers can reschedule.
++         */
++        fun evaluateAndNotify(
++            context: Context,
++            store: CaseBatteryStore,
++            config: CaseBatteryConfig,
++            caseLevel: Int,
++            budL: Int,
++            budR: Int,
++            caseIsCharging: Boolean
++        ): CaseBatteryEstimate {
++            val estimate = CaseBatteryMath.estimate(caseLevel, budL, budR, config, caseIsCharging)
++            if (!estimate.valid || !config.enabled) return estimate
++
++            val last = store.lastAlert()
++            val now = System.currentTimeMillis()
++
++            if (!estimate.shouldAlert) {
++                store.clearLastAlert()
++                context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
++                return estimate
++            }
++
++            val notify = CaseBatteryMath.shouldNotify(
++                reason = estimate.reason,
++                level = estimate.projectedCaseRounded,
++                lastReason = last?.reason,
++                lastLevel = last?.level ?: -1,
++                lastTimestampMs = last?.timestampMs ?: 0L,
++                nowMs = now
++            )
++            if (!notify) return estimate
++
++            showNotification(context, config, estimate)
++            store.saveLastAlert(estimate.reason.name, estimate.projectedCaseRounded, now)
++            return estimate
++        }
++
++        private fun showNotification(
++            context: Context,
++            config: CaseBatteryConfig,
++            estimate: CaseBatteryEstimate
++        ) {
++            createChannel(context)
++            val localized = LanguageUtils.setLocale(context)
++
++            val (days, hours) = CaseBatteryMath.splitHours(estimate.hoursUntilThreshold)
++            val etaText = if (days > 0) {
++                localized.getString(R.string.case_eta_days_hours, days, hours)
++            } else {
++                localized.getString(R.string.case_eta_hours, hours)
++            }
++
++            val title: String
++            val body: String
++            when (estimate.reason) {
++                CaseAlertReason.ALREADY_BELOW -> {
++                    title = localized.getString(R.string.case_alert_low_title, estimate.caseNow)
++                    body = localized.getString(R.string.case_alert_low_body, config.thresholdPercent)
++                }
++                CaseAlertReason.PROJECTED_BELOW -> {
++                    title = localized.getString(
++                        R.string.case_alert_projected_title, estimate.projectedCaseRounded
++                    )
++                    body = localized.getString(
++                        R.string.case_alert_projected_body,
++                        estimate.caseNow,
++                        estimate.chargeCostPercent.roundToInt(),
++                        config.thresholdPercent
++                    )
++                }
++                CaseAlertReason.STANDBY_ETA -> {
++                    title = localized.getString(R.string.case_alert_standby_title, config.thresholdPercent)
++                    body = localized.getString(
++                        R.string.case_alert_standby_body, etaText, estimate.projectedCaseRounded
++                    )
++                }
++                CaseAlertReason.NONE -> return
++            }
++
++            val contentIntent = PendingIntent.getActivity(
++                context, 5, Intent(context, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
++            )
++
++            val notification = NotificationCompat.Builder(context, CHANNEL_ID)
++                .setSmallIcon(R.mipmap.ic_launcher)
++                .setContentTitle(title)
++                .setContentText(body)
++                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
++                .setContentIntent(contentIntent)
++                .setAutoCancel(true)
++                .setOnlyAlertOnce(true)
++                .build()
++
++            try {
++                context.getSystemService(NotificationManager::class.java)
++                    ?.notify(NOTIFICATION_ID, notification)
++            } catch (e: SecurityException) {
++                Log.w(TAG, "Notification permission missing", e)
++            }
++        }
++    }
++
++    private val store = CaseBatteryStore(context)
++
++    fun start() {
++        createChannel(context)
++
++        scope.launch {
++            val placementFlow = combine(
++                budsController.placementL,
++                budsController.placementR,
++                budsController.chargingCase
++            ) { pL, pR, caseCharging -> Triple(pL, pR, caseCharging) }
++
++            combine(
++                budsController.batteryCase,
++                budsController.batteryL,
++                budsController.batteryR,
++                placementFlow,
++                budsController.effectiveModel
++            ) { caseLevel, bL, bR, placement, model ->
++                Reading(caseLevel, bL, bR, placement.first, placement.second, placement.third, model.name)
++            }.collect { reading -> onReading(reading) }
++        }
++    }
++
++    private data class Reading(
++        val caseLevel: Int,
++        val budL: Int,
++        val budR: Int,
++        val placementL: PlacementState,
++        val placementR: PlacementState,
++        val caseCharging: Boolean,
++        val modelName: String
++    )
++
++    private fun onReading(reading: Reading) {
++        val storedConfig = store.config(reading.modelName)
++        // Prefer a measured cost over the capacity-table guess once we have one.
++        val learned = store.learnedCost()
++        val config = if (learned != null) {
++            storedConfig.copy(
++                fullChargeCaseCostPercent =
++                    CaseBatteryMath.idealCostFromMeasured(learned, storedConfig.efficiencyPercent)
++            )
++        } else storedConfig
++
++        if (!CaseBatteryMath.isValidLevel(reading.caseLevel)) {
++            // Buds are out of the case: the case level is unknown, so close any episode.
++            store.clearEpisode()
++            return
++        }
++
++        updateCalibration(reading, config)
++        store.saveLastReading(reading.caseLevel, reading.budL, reading.budR)
++
++        val estimate = evaluateAndNotify(
++            context = context,
++            store = store,
++            config = config,
++            caseLevel = reading.caseLevel,
++            budL = reading.budL,
++            budR = reading.budR,
++            caseIsCharging = reading.caseCharging
++        )
++
++        if (config.taskerEnabled) {
++            TaskerBridge.broadcast(context, estimate, config, reading.caseCharging, reading.modelName)
++        }
++
++        if (config.enabled && !reading.caseCharging) {
++            scheduleStandbyCheck(
++                context,
++                CaseBatteryMath.nextStandbyCheckDelayMs(estimate.hoursUntilThreshold, config.alertHorizonHours)
++            )
++        } else {
++            cancelStandbyCheck(context)
++        }
++    }
++
++    /**
++     * Learn the real case cost by watching a charge episode: buds gain %, case loses %.
++     * Only counts while the case is not plugged in, otherwise the case tops itself up.
++     */
++    private fun updateCalibration(reading: Reading, config: CaseBatteryConfig) {
++        if (reading.caseCharging) {
++            store.clearEpisode()
++            return
++        }
++        if (!CaseBatteryMath.isValidLevel(reading.budL) || !CaseBatteryMath.isValidLevel(reading.budR)) return
++
++        val inCase = { p: PlacementState -> p == PlacementState.CASE || p == PlacementState.CLOSED_CASE }
++        if (!inCase(reading.placementL) || !inCase(reading.placementR)) {
++            store.clearEpisode()
++            return
++        }
++
++        val budAvg = (reading.budL + reading.budR) / 2.0
++        val start = store.episodeStart()
++        if (start == null) {
++            store.saveEpisodeStart(reading.caseLevel.toDouble(), budAvg)
++            return
++        }
++
++        val (startCase, startBudAvg) = start
++        val budGain = budAvg - startBudAvg
++        val caseDrop = startCase - reading.caseLevel
++
++        if (budGain < 0) {
++            // Buds were swapped or discharged: restart the episode.
++            store.saveEpisodeStart(reading.caseLevel.toDouble(), budAvg)
++            return
++        }
++
++        val measured = CaseBatteryMath.measuredFullCycleCost(budGain, caseDrop) ?: return
++        val blended = CaseBatteryMath.blendCalibration(store.learnedCost(), measured)
++        store.saveLearnedCost(blended)
++        store.saveEpisodeStart(reading.caseLevel.toDouble(), budAvg)
++        Log.d(TAG, "Calibrated case cost: measured=$measured blended=$blended (efficiency=${config.efficiencyPercent})")
++    }
++}
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryStore.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryStore.kt
+new file mode 100644
+index 0000000..d17ea4c
+--- /dev/null
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryStore.kt
+@@ -0,0 +1,134 @@
++package com.benegedeniz.budsdynamiceq.battery
++
++import android.content.Context
++import android.content.SharedPreferences
++
++/**
++ * Persistence for the case battery feature. Uses the same "BudsPrefs" file as the
++ * rest of the app so the settings screen can read it with its existing pattern.
++ */
++class CaseBatteryStore(context: Context) {
++
++    private val prefs: SharedPreferences =
++        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++
++    companion object {
++        const val PREFS_NAME = "BudsPrefs"
++
++        const val KEY_ENABLED = "case_alerts_enabled"
++        const val KEY_THRESHOLD = "case_threshold_percent"
++        const val KEY_EFFICIENCY = "case_efficiency_percent"
++        const val KEY_FULL_CYCLE_COST = "case_full_cycle_cost"
++        const val KEY_STANDBY_DRAIN = "case_standby_drain_per_day"
++        const val KEY_HORIZON_HOURS = "case_alert_horizon_hours"
++        const val KEY_TASKER = "case_tasker_enabled"
++
++        const val KEY_LEARNED_COST = "case_learned_effective_cost"
++        const val KEY_LAST_LEVEL = "case_last_level"
++        const val KEY_LAST_TS = "case_last_timestamp"
++        const val KEY_LAST_BUD_L = "case_last_bud_l"
++        const val KEY_LAST_BUD_R = "case_last_bud_r"
++
++        private const val KEY_EPISODE_CASE = "case_episode_case_level"
++        private const val KEY_EPISODE_BUD_AVG = "case_episode_bud_avg"
++
++        private const val KEY_ALERT_REASON = "case_alert_last_reason"
++        private const val KEY_ALERT_TS = "case_alert_last_ts"
++        private const val KEY_ALERT_LEVEL = "case_alert_last_level"
++
++        /** Floats are stored as strings to dodge Float/Double precision surprises in prefs. */
++        private fun SharedPreferences.getDoubleOrNull(key: String): Double? =
++            getString(key, null)?.toDoubleOrNull()
++    }
++
++    fun config(modelName: String?): CaseBatteryConfig {
++        val stored = prefs.getString(KEY_FULL_CYCLE_COST, null)?.toDoubleOrNull()
++        return CaseBatteryConfig(
++            enabled = prefs.getBoolean(KEY_ENABLED, false),
++            thresholdPercent = prefs.getInt(KEY_THRESHOLD, CaseBatteryConfig.DEFAULT_THRESHOLD),
++            efficiencyPercent = prefs.getInt(KEY_EFFICIENCY, CaseBatteryConfig.DEFAULT_EFFICIENCY),
++            fullChargeCaseCostPercent = stored ?: CaseBatteryMath.defaultFullCycleCost(modelName),
++            standbyDrainPerDay = prefs.getString(KEY_STANDBY_DRAIN, null)?.toDoubleOrNull()
++                ?: CaseBatteryConfig.DEFAULT_STANDBY_DRAIN,
++            alertHorizonHours = prefs.getInt(KEY_HORIZON_HOURS, CaseBatteryConfig.DEFAULT_HORIZON_HOURS),
++            taskerEnabled = prefs.getBoolean(KEY_TASKER, false)
++        )
++    }
++
++    fun setEnabled(value: Boolean) = prefs.edit().putBoolean(KEY_ENABLED, value).apply()
++    fun setThreshold(value: Int) = prefs.edit().putInt(KEY_THRESHOLD, value.coerceIn(1, 99)).apply()
++    fun setEfficiency(value: Int) = prefs.edit().putInt(KEY_EFFICIENCY, value.coerceIn(40, 100)).apply()
++    fun setStandbyDrain(value: Double) =
++        prefs.edit().putString(KEY_STANDBY_DRAIN, value.coerceIn(0.0, 20.0).toString()).apply()
++    fun setHorizonHours(value: Int) = prefs.edit().putInt(KEY_HORIZON_HOURS, value.coerceIn(1, 720)).apply()
++    fun setTaskerEnabled(value: Boolean) = prefs.edit().putBoolean(KEY_TASKER, value).apply()
++
++    fun setFullCycleCost(value: Double?) {
++        if (value == null) prefs.edit().remove(KEY_FULL_CYCLE_COST).apply()
++        else prefs.edit().putString(KEY_FULL_CYCLE_COST, value.coerceIn(2.0, 90.0).toString()).apply()
++    }
++
++    /** Measured effective cost learned from real charge episodes, or null if never measured. */
++    fun learnedCost(): Double? = prefs.getString(KEY_LEARNED_COST, null)?.toDoubleOrNull()
++
++    fun saveLearnedCost(value: Double) =
++        prefs.edit().putString(KEY_LEARNED_COST, value.toString()).apply()
++
++    // ---- last known reading, used by the standby alarm and by Tasker queries ----
++
++    data class LastReading(val caseLevel: Int, val budL: Int, val budR: Int, val timestampMs: Long)
++
++    fun lastReading(): LastReading? {
++        val level = prefs.getInt(KEY_LAST_LEVEL, -1)
++        val ts = prefs.getLong(KEY_LAST_TS, 0L)
++        if (!CaseBatteryMath.isValidLevel(level) || ts <= 0L) return null
++        return LastReading(level, prefs.getInt(KEY_LAST_BUD_L, -1), prefs.getInt(KEY_LAST_BUD_R, -1), ts)
++    }
++
++    fun saveLastReading(caseLevel: Int, budL: Int, budR: Int, now: Long = System.currentTimeMillis()) {
++        prefs.edit()
++            .putInt(KEY_LAST_LEVEL, caseLevel)
++            .putInt(KEY_LAST_BUD_L, budL)
++            .putInt(KEY_LAST_BUD_R, budR)
++            .putLong(KEY_LAST_TS, now)
++            .apply()
++    }
++
++    // ---- calibration episode tracking ----
++
++    fun episodeStart(): Pair<Double, Double>? {
++        val case = prefs.getDoubleOrNull(KEY_EPISODE_CASE) ?: return null
++        val budAvg = prefs.getDoubleOrNull(KEY_EPISODE_BUD_AVG) ?: return null
++        return Pair(case, budAvg)
++    }
++
++    fun saveEpisodeStart(caseLevel: Double, budAvg: Double) {
++        prefs.edit()
++            .putString(KEY_EPISODE_CASE, caseLevel.toString())
++            .putString(KEY_EPISODE_BUD_AVG, budAvg.toString())
++            .apply()
++    }
++
++    fun clearEpisode() =
++        prefs.edit().remove(KEY_EPISODE_CASE).remove(KEY_EPISODE_BUD_AVG).apply()
++
++    // ---- alert de-duplication ----
++
++    data class LastAlert(val reason: String, val level: Int, val timestampMs: Long)
++
++    fun lastAlert(): LastAlert? {
++        val reason = prefs.getString(KEY_ALERT_REASON, null) ?: return null
++        return LastAlert(reason, prefs.getInt(KEY_ALERT_LEVEL, -1), prefs.getLong(KEY_ALERT_TS, 0L))
++    }
++
++    fun saveLastAlert(reason: String, level: Int, now: Long = System.currentTimeMillis()) {
++        prefs.edit()
++            .putString(KEY_ALERT_REASON, reason)
++            .putInt(KEY_ALERT_LEVEL, level)
++            .putLong(KEY_ALERT_TS, now)
++            .apply()
++    }
++
++    fun clearLastAlert() =
++        prefs.edit().remove(KEY_ALERT_REASON).remove(KEY_ALERT_TS).remove(KEY_ALERT_LEVEL).apply()
++}
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerBridge.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerBridge.kt
+new file mode 100644
+index 0000000..059472a
+--- /dev/null
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerBridge.kt
+@@ -0,0 +1,114 @@
++package com.benegedeniz.budsdynamiceq.battery
++
++import android.content.Context
++import android.content.Intent
++import android.util.Log
++import kotlin.math.roundToInt
++
++/**
++ * Exposes battery state to Tasker (or any automation app) as a plain broadcast.
++ *
++ * Tasker setup:
++ *   Profile -> Event -> System -> Intent Received -> Action:
++ *     com.benegedeniz.budsdynamiceq.BATTERY_UPDATE
++ *   The extras arrive as %case_level, %case_projected, %hours_to_threshold, ...
++ *
++ * To pull the current values on demand, send:
++ *   Tasker -> Action -> System -> Send Intent
++ *     Action:  com.benegedeniz.budsdynamiceq.REQUEST_BATTERY
++ *     Package: com.benegedeniz.budsdynamiceq
++ *     Target:  Broadcast Receiver
++ * The app answers with a BATTERY_UPDATE broadcast.
++ */
++object TaskerBridge {
++
++    private const val TAG = "TaskerBridge"
++
++    const val ACTION_BATTERY_UPDATE = "com.benegedeniz.budsdynamiceq.BATTERY_UPDATE"
++    const val ACTION_REQUEST_BATTERY = "com.benegedeniz.budsdynamiceq.REQUEST_BATTERY"
++
++    const val EXTRA_CASE_LEVEL = "case_level"
++    const val EXTRA_CASE_PROJECTED = "case_projected"
++    const val EXTRA_CASE_COST = "case_charge_cost"
++    const val EXTRA_BUD_L = "bud_l"
++    const val EXTRA_BUD_R = "bud_r"
++    const val EXTRA_CASE_CHARGING = "case_charging"
++    const val EXTRA_THRESHOLD = "threshold"
++    const val EXTRA_BELOW_THRESHOLD = "below_threshold"
++    const val EXTRA_ALERT_REASON = "alert_reason"
++    const val EXTRA_HOURS_TO_THRESHOLD = "hours_to_threshold"
++    const val EXTRA_DAYS_TO_THRESHOLD = "days_to_threshold"
++    const val EXTRA_MODEL = "model"
++    const val EXTRA_VALID = "valid"
++    const val EXTRA_TIMESTAMP = "timestamp"
++    const val EXTRA_JSON = "json"
++
++    fun buildIntent(
++        estimate: CaseBatteryEstimate,
++        config: CaseBatteryConfig,
++        caseIsCharging: Boolean,
++        modelName: String
++    ): Intent {
++        val hours = if (estimate.hoursUntilThreshold.isFinite()) estimate.hoursUntilThreshold else -1.0
++        val days = if (hours >= 0) hours / 24.0 else -1.0
++        val projected = if (estimate.valid) estimate.projectedCaseRounded else -1
++
++        return Intent(ACTION_BATTERY_UPDATE).apply {
++            putExtra(EXTRA_CASE_LEVEL, estimate.caseNow)
++            putExtra(EXTRA_CASE_PROJECTED, projected)
++            putExtra(EXTRA_CASE_COST, estimate.chargeCostPercent.roundToInt())
++            putExtra(EXTRA_BUD_L, estimate.budL)
++            putExtra(EXTRA_BUD_R, estimate.budR)
++            putExtra(EXTRA_CASE_CHARGING, caseIsCharging)
++            putExtra(EXTRA_THRESHOLD, config.thresholdPercent)
++            putExtra(EXTRA_BELOW_THRESHOLD, estimate.shouldAlert)
++            putExtra(EXTRA_ALERT_REASON, estimate.reason.name)
++            putExtra(EXTRA_HOURS_TO_THRESHOLD, (hours * 10).roundToInt() / 10.0)
++            putExtra(EXTRA_DAYS_TO_THRESHOLD, (days * 100).roundToInt() / 100.0)
++            putExtra(EXTRA_MODEL, modelName)
++            putExtra(EXTRA_VALID, estimate.valid)
++            putExtra(EXTRA_TIMESTAMP, System.currentTimeMillis())
++            putExtra(EXTRA_JSON, toJson(estimate, config, caseIsCharging, modelName))
++        }
++    }
++
++    fun broadcast(
++        context: Context,
++        estimate: CaseBatteryEstimate,
++        config: CaseBatteryConfig,
++        caseIsCharging: Boolean,
++        modelName: String
++    ) {
++        try {
++            context.sendBroadcast(buildIntent(estimate, config, caseIsCharging, modelName))
++        } catch (e: Exception) {
++            Log.w(TAG, "Failed to broadcast battery state", e)
++        }
++    }
++
++    /** Small hand-rolled JSON so automation apps can parse one field instead of many extras. */
++    fun toJson(
++        estimate: CaseBatteryEstimate,
++        config: CaseBatteryConfig,
++        caseIsCharging: Boolean,
++        modelName: String
++    ): String {
++        val hours = if (estimate.hoursUntilThreshold.isFinite()) estimate.hoursUntilThreshold else -1.0
++        return buildString {
++            append("{")
++            append("\"case_level\":").append(estimate.caseNow).append(",")
++            append("\"case_projected\":").append(if (estimate.valid) estimate.projectedCaseRounded else -1).append(",")
++            append("\"case_charge_cost\":").append(estimate.chargeCostPercent.roundToInt()).append(",")
++            append("\"bud_l\":").append(estimate.budL).append(",")
++            append("\"bud_r\":").append(estimate.budR).append(",")
++            append("\"case_charging\":").append(caseIsCharging).append(",")
++            append("\"threshold\":").append(config.thresholdPercent).append(",")
++            append("\"below_threshold\":").append(estimate.shouldAlert).append(",")
++            append("\"alert_reason\":\"").append(estimate.reason.name).append("\",")
++            append("\"hours_to_threshold\":").append((hours * 10).roundToInt() / 10.0).append(",")
++            append("\"model\":\"").append(modelName).append("\",")
++            append("\"valid\":").append(estimate.valid)
++            append("}")
++        }
++    }
++}
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerQueryReceiver.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerQueryReceiver.kt
+new file mode 100644
+index 0000000..ca5a170
+--- /dev/null
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/battery/TaskerQueryReceiver.kt
+@@ -0,0 +1,59 @@
++package com.benegedeniz.budsdynamiceq.battery
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.util.Log
++import com.benegedeniz.budsdynamiceq.di.ServiceLocator
++
++/**
++ * Answers an on-demand query from Tasker with a BATTERY_UPDATE broadcast.
++ * Uses live values when the service is running, otherwise the last stored reading
++ * aged by the configured standby drain.
++ */
++class TaskerQueryReceiver : BroadcastReceiver() {
++
++    companion object {
++        private const val TAG = "TaskerQueryReceiver"
++    }
++
++    override fun onReceive(context: Context, intent: Intent?) {
++        if (intent?.action != TaskerBridge.ACTION_REQUEST_BATTERY) return
++
++        val store = CaseBatteryStore(context)
++        val deviceState = ServiceLocator.provideDeviceStateRepository(context)
++        val modelName = (deviceState.modelOverride.value ?: deviceState.connectedModel.value).name
++        val config = store.config(modelName)
++
++        if (!config.taskerEnabled) {
++            Log.d(TAG, "Tasker export is disabled in settings; ignoring query.")
++            return
++        }
++
++        val liveCase = deviceState.batteryCase.value
++        val caseCharging = deviceState.chargingCase.value
++
++        val estimate = if (CaseBatteryMath.isValidLevel(liveCase)) {
++            CaseBatteryMath.estimate(
++                caseNow = liveCase,
++                budL = deviceState.batteryL.value,
++                budR = deviceState.batteryR.value,
++                config = config,
++                caseIsCharging = caseCharging
++            )
++        } else {
++            val last = store.lastReading()
++            if (last == null) {
++                CaseBatteryMath.estimate(-1, -1, -1, config)
++            } else {
++                val elapsedHours = (System.currentTimeMillis() - last.timestampMs) / 3_600_000.0
++                val aged = CaseBatteryMath.levelAfterStandby(
++                    last.caseLevel.toDouble(), config.standbyDrainPerDay, elapsedHours
++                )
++                CaseBatteryMath.estimate(aged.toInt(), last.budL, last.budR, config)
++            }
++        }
++
++        TaskerBridge.broadcast(context, estimate, config, caseCharging, modelName)
++    }
++}
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/service/BudsService.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/service/BudsService.kt
+index 687bd0b..01de176 100644
+--- a/app/src/main/java/com/benegedeniz/budsdynamiceq/service/BudsService.kt
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/service/BudsService.kt
+@@ -196,6 +196,13 @@ class BudsService : Service() {
+         )
+         notificationCoordinator!!.start()
+ 
++        val caseBatteryMonitor = com.benegedeniz.budsdynamiceq.battery.CaseBatteryMonitor(
++            context = this,
++            scope = scope,
++            budsController = budsController
++        )
++        caseBatteryMonitor.start()
++
+         val widgetCoordinator = WidgetCoordinator(
+             context = this,
+             scope = scope,
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/AppSettingsScreen.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/AppSettingsScreen.kt
+index 63ed557..1b06511 100644
+--- a/app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/AppSettingsScreen.kt
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/AppSettingsScreen.kt
+@@ -626,6 +626,9 @@ fun AppSettingsScreen(
+                 }
+             }
+ 
++            // Case Battery Alerts Accordion Card
++            CaseBatterySettingsCard()
++
+             // System Integration Accordion Card
+             Card(
+                 shape = RoundedCornerShape(24.dp),
+diff --git a/app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/CaseBatterySettingsCard.kt b/app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/CaseBatterySettingsCard.kt
+new file mode 100644
+index 0000000..f150e04
+--- /dev/null
++++ b/app/src/main/java/com/benegedeniz/budsdynamiceq/ui/settings/CaseBatterySettingsCard.kt
+@@ -0,0 +1,334 @@
++package com.benegedeniz.budsdynamiceq.ui.settings
++
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.expandVertically
++import androidx.compose.animation.fadeIn
++import androidx.compose.animation.fadeOut
++import androidx.compose.animation.shrinkVertically
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.BatteryChargingFull
++import androidx.compose.material.icons.filled.KeyboardArrowDown
++import androidx.compose.material.icons.filled.KeyboardArrowUp
++import androidx.compose.material3.*
++import androidx.compose.runtime.*
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.hapticfeedback.HapticFeedbackType
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalHapticFeedback
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import com.benegedeniz.budsdynamiceq.R
++import com.benegedeniz.budsdynamiceq.battery.CaseBatteryMath
++import com.benegedeniz.budsdynamiceq.battery.CaseBatteryStore
++import com.benegedeniz.budsdynamiceq.di.ServiceLocator
++import kotlin.math.roundToInt
++
++/**
++ * Settings for the case battery threshold, the charge efficiency used to project
++ * how much of the case will be left, and the Tasker export.
++ */
++@Composable
++fun CaseBatterySettingsCard(modifier: Modifier = Modifier) {
++    val haptic = LocalHapticFeedback.current
++    val context = LocalContext.current
++    val store = remember(context) { CaseBatteryStore(context) }
++    val deviceState = remember(context) { ServiceLocator.provideDeviceStateRepository(context) }
++
++    val connectedModel by deviceState.connectedModel.collectAsState()
++    val modelOverride by deviceState.modelOverride.collectAsState()
++    val caseLevel by deviceState.batteryCase.collectAsState()
++    val budL by deviceState.batteryL.collectAsState()
++    val budR by deviceState.batteryR.collectAsState()
++    val modelName = (modelOverride ?: connectedModel).name
++
++    var isExpanded by remember { mutableStateOf(false) }
++    var config by remember(modelName) { mutableStateOf(store.config(modelName)) }
++    var learned by remember { mutableStateOf(store.learnedCost()) }
++
++    val estimate = remember(config, caseLevel, budL, budR) {
++        CaseBatteryMath.estimate(caseLevel, budL, budR, config)
++    }
++
++    Card(
++        shape = RoundedCornerShape(24.dp),
++        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
++        modifier = modifier.fillMaxWidth()
++    ) {
++        Column(modifier = Modifier.fillMaxWidth()) {
++            Row(
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .clickable {
++                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
++                        isExpanded = !isExpanded
++                    }
++                    .padding(20.dp),
++                verticalAlignment = Alignment.CenterVertically,
++                horizontalArrangement = Arrangement.SpaceBetween
++            ) {
++                Row(
++                    verticalAlignment = Alignment.CenterVertically,
++                    horizontalArrangement = Arrangement.spacedBy(12.dp)
++                ) {
++                    Icon(
++                        imageVector = Icons.Default.BatteryChargingFull,
++                        contentDescription = null,
++                        tint = MaterialTheme.colorScheme.primary,
++                        modifier = Modifier.size(24.dp)
++                    )
++                    Text(
++                        text = stringResource(R.string.case_battery_section),
++                        style = MaterialTheme.typography.titleMedium,
++                        fontWeight = FontWeight.Bold,
++                        color = MaterialTheme.colorScheme.onSurface
++                    )
++                }
++                Icon(
++                    imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
++                    contentDescription = null,
++                    tint = MaterialTheme.colorScheme.onSurfaceVariant
++                )
++            }
++
++            AnimatedVisibility(
++                visible = isExpanded,
++                enter = fadeIn() + expandVertically(),
++                exit = fadeOut() + shrinkVertically()
++            ) {
++                Column(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .padding(horizontal = 20.dp)
++                        .padding(bottom = 20.dp),
++                    verticalArrangement = Arrangement.spacedBy(12.dp)
++                ) {
++                    HorizontalDivider(
++                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.15f),
++                        modifier = Modifier.padding(bottom = 4.dp)
++                    )
++
++                    // Master switch
++                    ToggleRow(
++                        title = stringResource(R.string.case_battery_enable),
++                        subtitle = stringResource(R.string.case_battery_enable_desc),
++                        checked = config.enabled
++                    ) { value ->
++                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
++                        store.setEnabled(value)
++                        config = config.copy(enabled = value)
++                    }
++
++                    // Live preview
++                    Text(
++                        text = stringResource(R.string.case_preview_title),
++                        style = MaterialTheme.typography.bodyLarge,
++                        fontWeight = FontWeight.Bold,
++                        color = MaterialTheme.colorScheme.onSurface
++                    )
++                    Text(
++                        text = if (estimate.valid) {
++                            stringResource(
++                                R.string.case_preview_body,
++                                estimate.caseNow,
++                                estimate.projectedCaseRounded,
++                                estimate.chargeCostPercent.roundToInt()
++                            )
++                        } else {
++                            stringResource(R.string.case_preview_unknown)
++                        },
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
++                    )
++
++                    // Threshold
++                    SliderRow(
++                        title = stringResource(R.string.case_threshold),
++                        subtitle = stringResource(R.string.case_threshold_desc, config.thresholdPercent),
++                        value = config.thresholdPercent.toFloat(),
++                        range = 5f..80f,
++                        steps = 14 // 5..80 in steps of 5
++                    ) { value ->
++                        val v = value.roundToInt()
++                        store.setThreshold(v)
++                        config = config.copy(thresholdPercent = v)
++                    }
++
++                    // Efficiency
++                    SliderRow(
++                        title = stringResource(R.string.case_efficiency),
++                        subtitle = stringResource(R.string.case_efficiency_desc, config.efficiencyPercent),
++                        value = config.efficiencyPercent.toFloat(),
++                        range = 50f..100f,
++                        steps = 9 // 50..100 in steps of 5
++                    ) { value ->
++                        val v = value.roundToInt()
++                        store.setEfficiency(v)
++                        config = config.copy(efficiencyPercent = v)
++                    }
++
++                    // Cost per full charge, with the measured value when we have one
++                    Text(
++                        text = stringResource(R.string.case_full_cycle_cost),
++                        style = MaterialTheme.typography.bodyLarge,
++                        fontWeight = FontWeight.Bold,
++                        color = MaterialTheme.colorScheme.onSurface
++                    )
++                    Text(
++                        text = stringResource(
++                            R.string.case_full_cycle_cost_desc,
++                            String.format("%.1f", config.effectiveFullCycleCost)
++                        ),
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
++                    )
++                    learned?.let { measured ->
++                        OutlinedButton(
++                            onClick = {
++                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
++                                val ideal = CaseBatteryMath.idealCostFromMeasured(measured, config.efficiencyPercent)
++                                store.setFullCycleCost(ideal)
++                                config = config.copy(fullChargeCaseCostPercent = ideal)
++                            },
++                            modifier = Modifier.fillMaxWidth(),
++                            shape = RoundedCornerShape(14.dp)
++                        ) {
++                            Text(
++                                text = stringResource(
++                                    R.string.case_full_cycle_measured,
++                                    String.format("%.1f", measured)
++                                )
++                            )
++                        }
++                    }
++                    OutlinedButton(
++                        onClick = {
++                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
++                            store.setFullCycleCost(null)
++                            learned = null
++                            config = store.config(modelName)
++                        },
++                        modifier = Modifier.fillMaxWidth(),
++                        shape = RoundedCornerShape(14.dp)
++                    ) {
++                        Text(text = stringResource(R.string.case_full_cycle_reset))
++                    }
++
++                    // Standby drain
++                    SliderRow(
++                        title = stringResource(R.string.case_standby_drain),
++                        subtitle = stringResource(
++                            R.string.case_standby_drain_desc,
++                            String.format("%.1f", config.standbyDrainPerDay)
++                        ),
++                        value = config.standbyDrainPerDay.toFloat(),
++                        range = 0f..5f,
++                        steps = 19 // 0..5 in steps of 0.25
++                    ) { value ->
++                        val v = (value * 4f).roundToInt() / 4.0
++                        store.setStandbyDrain(v)
++                        config = config.copy(standbyDrainPerDay = v)
++                    }
++
++                    // Alert horizon
++                    SliderRow(
++                        title = stringResource(R.string.case_alert_horizon),
++                        subtitle = stringResource(R.string.case_alert_horizon_desc, config.alertHorizonHours),
++                        value = config.alertHorizonHours.toFloat(),
++                        range = 6f..168f,
++                        steps = 26 // 6..168 in steps of 6
++                    ) { value ->
++                        val v = (value / 6f).roundToInt() * 6
++                        store.setHorizonHours(v)
++                        config = config.copy(alertHorizonHours = v)
++                    }
++
++                    HorizontalDivider(
++                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.15f)
++                    )
++
++                    ToggleRow(
++                        title = stringResource(R.string.case_tasker_export),
++                        subtitle = stringResource(R.string.case_tasker_export_desc),
++                        checked = config.taskerEnabled
++                    ) { value ->
++                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
++                        store.setTaskerEnabled(value)
++                        config = config.copy(taskerEnabled = value)
++                    }
++
++                    Text(
++                        text = stringResource(R.string.case_tasker_help),
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
++                    )
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun ToggleRow(
++    title: String,
++    subtitle: String,
++    checked: Boolean,
++    onCheckedChange: (Boolean) -> Unit
++) {
++    Row(
++        modifier = Modifier.fillMaxWidth(),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.SpaceBetween
++    ) {
++        Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
++            Text(
++                text = title,
++                style = MaterialTheme.typography.bodyLarge,
++                fontWeight = FontWeight.Bold,
++                color = MaterialTheme.colorScheme.onSurface
++            )
++            Spacer(modifier = Modifier.height(4.dp))
++            Text(
++                text = subtitle,
++                style = MaterialTheme.typography.bodyMedium,
++                color = MaterialTheme.colorScheme.onSurfaceVariant
++            )
++        }
++        Switch(checked = checked, onCheckedChange = onCheckedChange)
++    }
++}
++
++@Composable
++private fun SliderRow(
++    title: String,
++    subtitle: String,
++    value: Float,
++    range: ClosedFloatingPointRange<Float>,
++    steps: Int,
++    onValueChange: (Float) -> Unit
++) {
++    Column(modifier = Modifier.fillMaxWidth()) {
++        Text(
++            text = title,
++            style = MaterialTheme.typography.bodyLarge,
++            fontWeight = FontWeight.Bold,
++            color = MaterialTheme.colorScheme.onSurface
++        )
++        Spacer(modifier = Modifier.height(4.dp))
++        Text(
++            text = subtitle,
++            style = MaterialTheme.typography.bodyMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
++        Slider(
++            value = value.coerceIn(range.start, range.endInclusive),
++            onValueChange = onValueChange,
++            valueRange = range,
++            steps = steps
++        )
++    }
++}
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 4392350..3dceb44 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -544,4 +544,38 @@
+     <string name="rule_applied_toast">Applied: %1$s</string>
+     <string name="not_affiliated_samsung">Not affiliated with Samsung Electronics Co., Ltd.</string>
+     <string name="open_source_by_benegedeniz">Bud Buddy is an open-source project by BenEgeDeniz</string>
++    <!-- Case battery threshold / efficiency -->
++    <string name="case_battery_section">Case Battery Alerts</string>
++    <string name="case_battery_enable">Enable Case Battery Alerts</string>
++    <string name="case_battery_enable_desc">Warn when the charging case will not have enough left after topping up your earbuds.</string>
++    <string name="case_threshold">Low Case Threshold</string>
++    <string name="case_threshold_desc">Alert when the case is at or below this level. Currently %1$d%%.</string>
++    <string name="case_efficiency">Charging Efficiency</string>
++    <string name="case_efficiency_desc">How much of the case charge actually reaches the earbuds. Lower values assume more loss. Currently %1$d%%.</string>
++    <string name="case_full_cycle_cost">Case Cost per Full Charge</string>
++    <string name="case_full_cycle_cost_desc">Case charge used to fill both earbuds from empty: %1$s%%.</string>
++    <string name="case_full_cycle_measured">Measured on your case: %1$s%%. Tap to use it.</string>
++    <string name="case_full_cycle_reset">Reset to the estimate for your model</string>
++    <string name="case_standby_drain">Standby Drain</string>
++    <string name="case_standby_drain_desc">How fast the case loses charge while idle: %1$s%% per day.</string>
++    <string name="case_alert_horizon">Alert Ahead Of Time</string>
++    <string name="case_alert_horizon_desc">Warn when the case will reach the threshold within %1$d hours.</string>
++    <string name="case_tasker_export">Expose to Tasker</string>
++    <string name="case_tasker_export_desc">Broadcast battery values so Tasker and other automation apps can read them.</string>
++    <string name="case_tasker_help">Tasker: Event → System → Intent Received → com.benegedeniz.budsdynamiceq.BATTERY_UPDATE. Query anytime by broadcasting com.benegedeniz.budsdynamiceq.REQUEST_BATTERY.</string>
++    <string name="case_preview_title">Right now</string>
++    <string name="case_preview_unknown">Put an earbud in the case to read the case level.</string>
++    <string name="case_preview_body">Case %1$d%% → about %2$d%% once both earbuds are full (uses %3$d%%).</string>
++
++    <!-- Case battery notifications -->
++    <string name="case_battery_channel_name">Case Battery</string>
++    <string name="case_battery_channel_desc">Alerts about the charging case running low.</string>
++    <string name="case_alert_low_title">Case is at %1$d%%</string>
++    <string name="case_alert_low_body">Already at or below your %1$d%% threshold. Charge the case soon.</string>
++    <string name="case_alert_projected_title">Case will drop to about %1$d%%</string>
++    <string name="case_alert_projected_body">The case is at %1$d%% and charging your earbuds should use about %2$d%%, leaving it under your %3$d%% threshold.</string>
++    <string name="case_alert_standby_title">Case reaches %1$d%% soon</string>
++    <string name="case_alert_standby_body">About %1$s left at the current standby drain, from an estimated %2$d%%.</string>
++    <string name="case_eta_days_hours">%1$d d %2$d h</string>
++    <string name="case_eta_hours">%1$d h</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/test/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMathTest.kt b/app/src/test/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMathTest.kt
+new file mode 100644
+index 0000000..b7ca5c9
+--- /dev/null
++++ b/app/src/test/java/com/benegedeniz/budsdynamiceq/battery/CaseBatteryMathTest.kt
+@@ -0,0 +1,176 @@
++package com.benegedeniz.budsdynamiceq.battery
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class CaseBatteryMathTest {
++
++    private val config = CaseBatteryConfig(
++        enabled = true,
++        thresholdPercent = 30,
++        efficiencyPercent = 85,
++        fullChargeCaseCostPercent = 20.6,
++        standbyDrainPerDay = 1.0,
++        alertHorizonHours = 72
++    )
++
++    @Test
++    fun `efficiency scales the full cycle cost`() {
++        assertEquals(24.235, config.effectiveFullCycleCost, 0.01)
++        assertEquals(20.6, config.copy(efficiencyPercent = 100).effectiveFullCycleCost, 0.001)
++    }
++
++    @Test
++    fun `efficiency of zero does not divide by zero`() {
++        assertTrue(config.copy(efficiencyPercent = 0).effectiveFullCycleCost.isFinite())
++    }
++
++    @Test
++    fun `deficit fraction covers both buds`() {
++        assertEquals(1.0, CaseBatteryMath.budDeficitFraction(0, 0), 0.0001)
++        assertEquals(0.0, CaseBatteryMath.budDeficitFraction(100, 100), 0.0001)
++        assertEquals(0.4, CaseBatteryMath.budDeficitFraction(80, 40), 0.0001)
++    }
++
++    @Test
++    fun `a single known bud mirrors its twin`() {
++        assertEquals(0.6, CaseBatteryMath.budDeficitFraction(-1, 40), 0.0001)
++        assertEquals(0.0, CaseBatteryMath.budDeficitFraction(-1, -1), 0.0001)
++    }
++
++    @Test
++    fun `case that cannot cover the earbuds raises a projected alert`() {
++        val estimate = CaseBatteryMath.estimate(45, 30, 35, config)
++        assertTrue(estimate.valid)
++        assertEquals(16.36, estimate.chargeCostPercent, 0.02)
++        assertEquals(28.64, estimate.projectedCasePercent, 0.02)
++        assertEquals(CaseAlertReason.PROJECTED_BELOW, estimate.reason)
++    }
++
++    @Test
++    fun `healthy case stays quiet`() {
++        val estimate = CaseBatteryMath.estimate(95, 60, 60, config)
++        assertEquals(CaseAlertReason.NONE, estimate.reason)
++        assertFalse(estimate.shouldAlert)
++    }
++
++    @Test
++    fun `case already under the threshold alerts immediately`() {
++        assertEquals(CaseAlertReason.ALREADY_BELOW, CaseBatteryMath.estimate(25, 90, 90, config).reason)
++    }
++
++    @Test
++    fun `standby decay produces an eta alert inside the horizon`() {
++        val estimate = CaseBatteryMath.estimate(33, 100, 100, config)
++        assertEquals(72.0, estimate.hoursUntilThreshold, 0.01)
++        assertEquals(CaseAlertReason.STANDBY_ETA, estimate.reason)
++    }
++
++    @Test
++    fun `no standby drain means no eta alert`() {
++        val estimate = CaseBatteryMath.estimate(50, 100, 100, config.copy(standbyDrainPerDay = 0.0))
++        assertTrue(estimate.hoursUntilThreshold.isInfinite())
++        assertEquals(CaseAlertReason.NONE, estimate.reason)
++    }
++
++    @Test
++    fun `unknown case level is invalid and silent`() {
++        val estimate = CaseBatteryMath.estimate(-1, 50, 50, config)
++        assertFalse(estimate.valid)
++        assertFalse(estimate.shouldAlert)
++    }
++
++    @Test
++    fun `a charging case never alerts`() {
++        assertFalse(CaseBatteryMath.estimate(10, 10, 10, config, caseIsCharging = true).shouldAlert)
++    }
++
++    @Test
++    fun `projection stays within bounds`() {
++        assertTrue(CaseBatteryMath.estimate(3, 0, 0, config).projectedCasePercent >= 0.0)
++        assertTrue(CaseBatteryMath.estimate(100, 100, 100, config).projectedCasePercent <= 100.0)
++    }
++
++    @Test
++    fun `standby decay is linear and floors at zero`() {
++        assertEquals(48.0, CaseBatteryMath.levelAfterStandby(50.0, 1.0, 48.0), 0.0001)
++        assertEquals(0.0, CaseBatteryMath.levelAfterStandby(1.0, 5.0, 480.0), 0.0001)
++    }
++
++    @Test
++    fun `calibration derives the effective cost from one episode`() {
++        assertEquals(23.333, CaseBatteryMath.measuredFullCycleCost(60.0, 14.0)!!, 0.01)
++        assertNull(CaseBatteryMath.measuredFullCycleCost(5.0, 1.0))
++        assertNull(CaseBatteryMath.measuredFullCycleCost(60.0, 0.0))
++        assertNull(CaseBatteryMath.measuredFullCycleCost(20.0, 30.0))
++    }
++
++    @Test
++    fun `measured cost round trips through the stored ideal cost`() {
++        val ideal = CaseBatteryMath.idealCostFromMeasured(23.333, 85)
++        val restored = CaseBatteryConfig(fullChargeCaseCostPercent = ideal, efficiencyPercent = 85)
++        assertEquals(23.333, restored.effectiveFullCycleCost, 0.01)
++    }
++
++    @Test
++    fun `calibration blending is an ewma`() {
++        assertEquals(24.0, CaseBatteryMath.blendCalibration(null, 24.0), 0.0001)
++        assertEquals(24.0, CaseBatteryMath.blendCalibration(20.0, 30.0, 0.4), 0.0001)
++    }
++
++    @Test
++    fun `notifications are deduplicated`() {
++        val now = 1_000_000_000L
++        assertTrue(CaseBatteryMath.shouldNotify(CaseAlertReason.PROJECTED_BELOW, 40, null, -1, 0, now))
++        assertFalse(CaseBatteryMath.shouldNotify(CaseAlertReason.NONE, 40, null, -1, 0, now))
++        assertFalse(
++            CaseBatteryMath.shouldNotify(
++                CaseAlertReason.PROJECTED_BELOW, 40, "PROJECTED_BELOW", 40, now - 1000, now
++            )
++        )
++        assertTrue(
++            CaseBatteryMath.shouldNotify(
++                CaseAlertReason.PROJECTED_BELOW, 40, "PROJECTED_BELOW", 40,
++                now - CaseBatteryMath.DEFAULT_COOLDOWN_MS, now
++            )
++        )
++        assertTrue(
++            CaseBatteryMath.shouldNotify(
++                CaseAlertReason.ALREADY_BELOW, 40, "PROJECTED_BELOW", 40, now - 1000, now
++            )
++        )
++        assertTrue(
++            CaseBatteryMath.shouldNotify(
++                CaseAlertReason.PROJECTED_BELOW, 35, "PROJECTED_BELOW", 40, now - 1000, now
++            )
++        )
++    }
++
++    @Test
++    fun `standby wake up is clamped between one and twenty four hours`() {
++        val hour = 3_600_000L
++        assertEquals(24 * hour, CaseBatteryMath.nextStandbyCheckDelayMs(500.0, 72))
++        assertEquals(hour, CaseBatteryMath.nextStandbyCheckDelayMs(73.0, 72))
++        assertEquals(8 * hour, CaseBatteryMath.nextStandbyCheckDelayMs(80.0, 72))
++        assertEquals(24 * hour, CaseBatteryMath.nextStandbyCheckDelayMs(Double.POSITIVE_INFINITY, 72))
++    }
++
++    @Test
++    fun `hour formatting splits into days and hours`() {
++        assertEquals(Pair(2, 2), CaseBatteryMath.splitHours(50.0))
++        assertEquals(Pair(1, 0), CaseBatteryMath.splitHours(23.6))
++    }
++
++    @Test
++    fun `charge cost never decreases as the earbuds get emptier`() {
++        var previous = -1.0
++        for (level in 100 downTo 0 step 5) {
++            val cost = CaseBatteryMath.chargeCost(level, level, config)
++            assertTrue(cost >= previous - 1e-9)
++            previous = cost
++        }
++    }
++}
+-- 
+2.43.0
+
