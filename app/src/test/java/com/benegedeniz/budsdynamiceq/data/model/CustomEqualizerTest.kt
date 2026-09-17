@@ -37,6 +37,8 @@ class CustomEqualizerTest {
 
     @Test
     fun customPreset_usesWearablePayload() {
-        assertEquals(0x07.toByte(), EqPreset.CUSTOM.payloadByte)
+        assertEquals(0x07.toByte(), EqPreset.CUSTOM_1.payloadByte)
+        assertEquals(0x07.toByte(), EqPreset.CUSTOM_2.payloadByte)
+        assertEquals(0x07.toByte(), EqPreset.CUSTOM_3.payloadByte)
     }
 }
