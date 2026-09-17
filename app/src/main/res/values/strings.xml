@@ -544,4 +544,38 @@
     <string name="rule_applied_toast">Applied: %1$s</string>
     <string name="not_affiliated_samsung">Not affiliated with Samsung Electronics Co., Ltd.</string>
     <string name="open_source_by_benegedeniz">Bud Buddy is an open-source project by BenEgeDeniz</string>
+    <!-- Case battery threshold / efficiency -->
+    <string name="case_battery_section">Case Battery Alerts</string>
+    <string name="case_battery_enable">Enable Case Battery Alerts</string>
+    <string name="case_battery_enable_desc">Warn when the charging case will not have enough left after topping up your earbuds.</string>
+    <string name="case_threshold">Low Case Threshold</string>
+    <string name="case_threshold_desc">Alert when the case is at or below this level. Currently %1$d%%.</string>
+    <string name="case_efficiency">Charging Efficiency</string>
+    <string name="case_efficiency_desc">How much of the case charge actually reaches the earbuds. Lower values assume more loss. Currently %1$d%%.</string>
+    <string name="case_full_cycle_cost">Case Cost per Full Charge</string>
+    <string name="case_full_cycle_cost_desc">Case charge used to fill both earbuds from empty: %1$s%%.</string>
+    <string name="case_full_cycle_measured">Measured on your case: %1$s%%. Tap to use it.</string>
+    <string name="case_full_cycle_reset">Reset to the estimate for your model</string>
+    <string name="case_standby_drain">Standby Drain</string>
+    <string name="case_standby_drain_desc">How fast the case loses charge while idle: %1$s%% per day.</string>
+    <string name="case_alert_horizon">Alert Ahead Of Time</string>
+    <string name="case_alert_horizon_desc">Warn when the case will reach the threshold within %1$d hours.</string>
+    <string name="case_tasker_export">Expose to Tasker</string>
+    <string name="case_tasker_export_desc">Broadcast battery values so Tasker and other automation apps can read them.</string>
+    <string name="case_tasker_help">Tasker: Event → System → Intent Received → com.benegedeniz.budsdynamiceq.BATTERY_UPDATE. Query anytime by broadcasting com.benegedeniz.budsdynamiceq.REQUEST_BATTERY.</string>
+    <string name="case_preview_title">Right now</string>
+    <string name="case_preview_unknown">Put an earbud in the case to read the case level.</string>
+    <string name="case_preview_body">Case %1$d%% → about %2$d%% once both earbuds are full (uses %3$d%%).</string>
+
+    <!-- Case battery notifications -->
+    <string name="case_battery_channel_name">Case Battery</string>
+    <string name="case_battery_channel_desc">Alerts about the charging case running low.</string>
+    <string name="case_alert_low_title">Case is at %1$d%%</string>
+    <string name="case_alert_low_body">Already at or below your %1$d%% threshold. Charge the case soon.</string>
+    <string name="case_alert_projected_title">Case will drop to about %1$d%%</string>
+    <string name="case_alert_projected_body">The case is at %1$d%% and charging your earbuds should use about %2$d%%, leaving it under your %3$d%% threshold.</string>
+    <string name="case_alert_standby_title">Case reaches %1$d%% soon</string>
+    <string name="case_alert_standby_body">About %1$s left at the current standby drain, from an estimated %2$d%%.</string>
+    <string name="case_eta_days_hours">%1$d d %2$d h</string>
+    <string name="case_eta_hours">%1$d h</string>
 </resources>

@@ -626,6 +626,9 @@ fun AppSettingsScreen(
                 }
             }
 
+            // Case Battery Alerts Accordion Card
+            CaseBatterySettingsCard()
+
             // System Integration Accordion Card
             Card(
                 shape = RoundedCornerShape(24.dp),

@@ -196,6 +196,13 @@ class BudsService : Service() {
         )
         notificationCoordinator!!.start()
 
+        val caseBatteryMonitor = com.benegedeniz.budsdynamiceq.battery.CaseBatteryMonitor(
+            context = this,
+            scope = scope,
+            budsController = budsController
+        )
+        caseBatteryMonitor.start()
+
         val widgetCoordinator = WidgetCoordinator(
             context = this,
             scope = scope,

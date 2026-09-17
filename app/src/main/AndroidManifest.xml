@@ -83,6 +83,26 @@
             </intent-filter>
         </receiver>
 
+        <receiver
+            android:name=".battery.CaseBatteryAlarmReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.benegedeniz.budsdynamiceq.CASE_STANDBY_CHECK" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Exported so Tasker and similar automation apps can ask for the current
+             battery state. It only answers when "Expose to Tasker" is enabled. -->
+        <receiver
+            android:name=".battery.TaskerQueryReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.benegedeniz.budsdynamiceq.REQUEST_BATTERY" />
+            </intent-filter>
+        </receiver>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.provider"
